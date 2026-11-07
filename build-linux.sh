@@ -21,6 +21,11 @@
 #   --no-cpu-check     Skip host detection (cross-building); needs --level
 #   --gcc              Use GCC instead of clang
 #   --no-lto           Disable LTO
+#   --lto              Full LTO (default): best code, but the link is slow and
+#                      mostly single-threaded
+#   --thin-lto         ThinLTO (clang only, best with lld): parallel link with
+#                      an on-disk cache, far faster links and rebuilds, usually
+#                      within a few percent of full LTO
 #   --clean            Wipe the build directory first
 #   --install-deps     Install build dependencies (dnf / apt / pacman; on Arch
 #                      this runs pacman -Syu, i.e. a full system upgrade)
@@ -51,6 +56,7 @@ MAX_LEVEL=4
 USE_NATIVE=0
 USE_CLANG=1
 USE_LTO=1
+LTO_MODE=full          # full | thin
 CLEAN=0
 INSTALL_DEPS=0
 CHECK_DEPS_ONLY=0
@@ -90,7 +96,8 @@ while [[ $# -gt 0 ]]; do
         --gcc)            USE_CLANG=0; shift ;;
         --clang)          USE_CLANG=1; shift ;;
         --no-lto)         USE_LTO=0; shift ;;
-        --lto)            USE_LTO=1; shift ;;
+        --lto)            USE_LTO=1; LTO_MODE=full; shift ;;
+        --thin-lto)       USE_LTO=1; LTO_MODE=thin; shift ;;
         --clean)          CLEAN=1; shift ;;
         --install-deps)   INSTALL_DEPS=1; shift ;;
         --check-deps)     CHECK_DEPS_ONLY=1; shift ;;
@@ -459,18 +466,23 @@ check_toolchain() {
             export CC=clang CXX=clang++
         fi
     else
-        # an inherited CC that is really clang must not leak into a --gcc build
+        # an inherited CC or CXX that is really clang must not leak into a
+        # --gcc build; each is checked on its own so a mixed pair is handled
         if [[ -n "$env_cc" ]] && command -v "$env_cc" >/dev/null \
             && "$env_cc" --version 2>/dev/null | grep -qi clang; then
-            env_cc=""; env_cxx=""
+            env_cc=""
+        fi
+        if [[ -n "$env_cxx" ]] && command -v "$env_cxx" >/dev/null \
+            && "$env_cxx" --version 2>/dev/null | grep -qi clang; then
+            env_cxx=""
         fi
         command -v "${env_cc:-gcc}" >/dev/null || die "${env_cc:-gcc} not found (try --install-deps)"
         export CC="${env_cc:-gcc}" CXX="${env_cxx:-g++}"
     fi
 }
 
-LINK_ARGS=()
-# pick_linker - choose lld (with clang) or mold when usable and fill LINK_ARGS.
+LINK_ARGS=(); LINK_LD=""
+# pick_linker - choose lld (with clang) or mold when usable; sets LINK_LD.
 pick_linker() {
     local ld="" is_clang=0
     # Ask the compiler itself; names lie (c++ is often GCC). lld cannot read
@@ -483,10 +495,37 @@ pick_linker() {
     fi
     if [[ -n "$ld" ]]; then
         log "Linker: $ld"
+        LINK_LD="$ld"
+    fi
+}
+
+# check_lto - ThinLTO needs clang; warn when the linker cannot cache its work.
+check_lto() {
+    ((USE_LTO)) && [[ "$LTO_MODE" == thin ]] || return 0
+    "$CXX" --version 2>/dev/null | grep -qi clang \
+        || die "--thin-lto needs clang (drop --gcc, or use --lto)"
+    [[ "$LINK_LD" == lld ]] \
+        || warn "ThinLTO works best with lld (not usable here); the link cache is disabled"
+}
+
+# build_link_args - fill LINK_ARGS from the chosen linker and LTO mode.
+# Needs BUILD_DIR (the ThinLTO cache lives inside it).
+build_link_args() {
+    local f=""
+    [[ -n "$LINK_LD" ]] && f="-fuse-ld=$LINK_LD"
+    if ((USE_LTO)) && [[ "$LTO_MODE" == thin ]]; then
+        f+="${f:+ }-flto=thin"
+        # CMake splits flag strings on spaces, so skip the cache for such paths
+        if [[ "$LINK_LD" == lld && "$BUILD_DIR" != *[[:space:]]* ]]; then
+            f+=" -Wl,--thinlto-cache-dir=$BUILD_DIR/lto-cache"
+        fi
+    fi
+    LINK_ARGS=()
+    if [[ -n "$f" ]]; then
         LINK_ARGS=(
-            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=$ld"
-            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=$ld"
-            -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=$ld"
+            -DCMAKE_EXE_LINKER_FLAGS="$f"
+            -DCMAKE_SHARED_LINKER_FLAGS="$f"
+            -DCMAKE_MODULE_LINKER_FLAGS="$f"
         )
     fi
 }
@@ -497,7 +536,7 @@ pick_jobs() {
     local cores mem_gb per_job=2 by_mem
     cores="$(nproc)"
     mem_gb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
-    ((USE_LTO)) && per_job=3
+    ((USE_LTO)) && [[ "$LTO_MODE" == full ]] && per_job=3
     by_mem=$(( mem_gb / per_job )); ((by_mem < 1)) && by_mem=1
     JOBS=$(( cores < by_mem ? cores : by_mem ))
     ((JOBS < cores)) && warn "limiting to $JOBS jobs (${mem_gb} GB RAM, ~${per_job} GB per job); override with -j"
@@ -512,6 +551,7 @@ setup_deps
 check_toolchain
 select_arch_flags
 pick_linker
+check_lto
 pick_jobs
 
 [[ -f "$SRC_DIR/CMakeLists.txt" ]] || die "no CMakeLists.txt in $SRC_DIR (run from the repo root or use --src)"
@@ -565,6 +605,12 @@ if [[ -z "$BUNDLE_VULKAN" ]]; then
     [[ "$FAMILY" == debian ]] && BUNDLE_VULKAN=0 || BUNDLE_VULKAN=1
 fi
 
+# ThinLTO is requested through the compiler flag itself: CMake's IPO switch may
+# pick full LTO, and a later plain -flto would override -flto=thin.
+CODEGEN_FLAGS="$ARCH_FLAGS"
+if ((USE_LTO)) && [[ "$LTO_MODE" == thin ]]; then CODEGEN_FLAGS+=" -flto=thin"; fi
+build_link_args
+
 # YUZU_BUILD_PRESET only knows generic/v3/zen2/zen4/native, so keep it on
 # "custom" (no -march injected) and pass the arch flags ourselves.
 CMAKE_ARGS=(
@@ -575,11 +621,12 @@ CMAKE_ARGS=(
     -DCMAKE_C_COMPILER="$(command -v "$CC")"
     -DCMAKE_CXX_COMPILER="$(command -v "$CXX")"
     -DYUZU_BUILD_PRESET=custom
-    -DCMAKE_C_FLAGS="$ARCH_FLAGS"
-    -DCMAKE_CXX_FLAGS="$ARCH_FLAGS"
+    -DCMAKE_C_FLAGS="$CODEGEN_FLAGS"
+    -DCMAKE_CXX_FLAGS="$CODEGEN_FLAGS"
     -DENABLE_QT="$ENABLE_QT"
     -DENABLE_WERROR="$WERROR"
     -DYUZU_TESTS=OFF
+    -DDYNARMIC_TESTS=OFF
 )
 CMAKE_ARGS+=("${LINK_ARGS[@]+"${LINK_ARGS[@]}"}")
 
@@ -594,7 +641,10 @@ CMAKE_ARGS+=(
 # Also pass the "off" states: CMake keeps whatever a previous configure cached
 # in a reused build directory, so --no-lto / --system-vulkan would otherwise
 # stay on. EXTRA_CMAKE_ARGS is appended last, so it still wins.
-if ((USE_LTO)); then CMAKE_ARGS+=(-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON)
+if ((USE_LTO)) && [[ "$LTO_MODE" == thin ]]; then
+    # -flto=thin is already in the flags above; keep CMake's own LTO switches off
+    CMAKE_ARGS+=(-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF -DENABLE_LTO=OFF)
+elif ((USE_LTO)); then CMAKE_ARGS+=(-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON)
 else CMAKE_ARGS+=(-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF -DENABLE_LTO=OFF)
 fi
 if command -v ccache >/dev/null; then
@@ -628,7 +678,7 @@ if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
     fi
 fi
 
-log "Configuring ($LEVEL_LABEL, $BUILD_TYPE, $CC, flags: $ARCH_FLAGS)"
+log "Configuring ($LEVEL_LABEL, $BUILD_TYPE, $CC, flags: $CODEGEN_FLAGS)"
 cmake "${CMAKE_ARGS[@]}"
 
 # Final guard: the compiler CMake actually used must be the one we planned for
